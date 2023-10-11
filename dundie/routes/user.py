@@ -2,6 +2,7 @@ from sqlmodel import Session, select
 from dundie.models.user import (
     User,
     UserResponse,
+    UserResponseWithBalance,
     UserRequest,
     UserProfilePatchRequest,
     UserPasswordPatchRequest,
@@ -9,52 +10,74 @@ from dundie.models.user import (
 from dundie.db import ActiveSession
 from fastapi import APIRouter, HTTPException, Body, BackgroundTasks
 from typing import List
-from dundie.auth import AuthenticatedUser, Superuser, CanChangeUserPassword
+from dundie.auth import AuthenticatedUser, CanChangeUserPassword, ShowBalanceField, SuperUser
 from sqlalchemy.exc import IntegrityError
 from dundie.tasks.user import try_to_send_pwd_reset_email
-
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from pydantic import parse_obj_as
 
 router = APIRouter()
 
 
-@router.get("/", response_model=List[UserResponse])
-async def list_users(*, session: Session = ActiveSession):
-    """List all users from database"""
+@router.get(
+    "/",
+    response_model=List[UserResponse] | List[UserResponseWithBalance],
+    response_model_exclude_unset=True,
+)
+async def list_users(
+    *, session: Session = ActiveSession, show_balance_field: bool = ShowBalanceField
+):
+    """List all users.
 
+    NOTES:
+    - This endpoint can be accessed with a token authentication
+    - show_balance query parameter takes effect only for authenticated superuser.
+    """
     users = session.exec(select(User)).all()
+    if show_balance_field:
+        users_with_balance = parse_obj_as(List[UserResponseWithBalance], users)
+        return JSONResponse(jsonable_encoder(users_with_balance))
     return users
 
 
-@router.post("/", response_model=UserResponse, status_code=201, dependencies=[Superuser])
+@router.get(
+    "/{username}/",
+    response_model=UserResponse | UserResponseWithBalance,
+    response_model_exclude_unset=True,
+)
+async def get_user_by_username(
+    *, session: Session = ActiveSession, username: str, show_balance_field: bool = ShowBalanceField
+):
+    """Get user by username"""
+    query = select(User).where(User.username == username)
+    user = session.exec(query).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if show_balance_field:
+        user_with_balance = parse_obj_as(UserResponseWithBalance, user)
+        return JSONResponse(jsonable_encoder(user_with_balance))
+    return user
+
+
+@router.post("/", response_model=UserResponse, status_code=201, dependencies=[SuperUser])
 async def create_user(*, session: Session = ActiveSession, user: UserRequest):
-    """Creates a new user"""
-
-    if session.exec(select(User).where(User.email == user.email)).first():
-        raise HTTPException(status_code=409, detail="email already in use")
-
+    """Creates new user"""
     if session.exec(select(User).where(User.username == user.username)).first():
-        raise HTTPException(status_code=409, detail="username already in use")
+        raise HTTPException(status_code=409, detail="Username already taken")
 
-    db_user = User.from_orm(user)
+    db_user = User.from_orm(user)  # transform UserRequest in User
     session.add(db_user)
     try:
         session.commit()
     except IntegrityError:
         raise HTTPException(status_code=500, detail="Database IntegrityError")
+
     session.refresh(db_user)
     return db_user
 
 
-@router.get("/{username}/", response_model=UserResponse)
-async def get_user_by_username(*, session: Session = ActiveSession, username: str):
-    """Get a single user by username"""
-
-    query = select(User).where(User.username == username)
-    user = session.exec(query).first()
-    return user
-
-
-@router.patch("/{username}", response_model=UserResponse)
+@router.patch("/{username}/", response_model=UserResponse)
 async def update_user(
     *,
     session: Session = ActiveSession,
@@ -68,15 +91,13 @@ async def update_user(
     if user.id != current_user.id and not current_user.superuser:
         raise HTTPException(status_code=403, detail="You can only update your own profile")
 
-    if patch_data.avatar is not None:
-        user.avatar = patch_data.avatar
-    if patch_data.bio is not None:
-        user.bio = patch_data.bio
+    # Update
+    user.avatar = patch_data.avatar
+    user.bio = patch_data.bio
 
     session.add(user)
     session.commit()
     session.refresh(user)
-
     return user
 
 
@@ -96,9 +117,9 @@ async def change_password(
 
 @router.post("/pwd_reset_token/")
 async def send_password_reset_token(
-    *, email: str = Body(embed=True), background_tasks: BackgroundTasks
+    *,
+    email: str = Body(embed=True),
+    background_tasks: BackgroundTasks,
 ):
-    """Sends an email with the token to reset password"""
-
     background_tasks.add_task(try_to_send_pwd_reset_email, email=email)
-    return {"nessage": "Email sent if email is valid"}
+    return {"message": "If we found a user with that email, we sent a password reset token to it."}

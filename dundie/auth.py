@@ -1,9 +1,9 @@
 """Token based auth"""
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Union
 from functools import partial
+from typing import Callable, Optional, Union
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Path, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
@@ -134,22 +134,29 @@ async def get_current_active_user(
 AuthenticatedUser = Depends(get_current_active_user)
 
 
-async def get_current_super_user(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """Wraps the sync get_super_user for sync calls"""
-    if not current_user.superuser:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a superuser")
-    return current_user
-
-
-Superuser = Depends(get_current_super_user)
-
-
 async def validate_token(token: str = Depends(oauth2_scheme)) -> User:
     """Validates user token"""
     user = get_current_user(token=token)
     return user
+
+
+async def get_current_super_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if not current_user.superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a super user")
+    return current_user
+
+
+SuperUser = Depends(get_current_super_user)
+
+
+async def get_current_user_or_none():
+    """Returns the current user or None"""
+    try:
+        yield Depends(get_current_user)
+    except HTTPException:
+        yield None
 
 
 async def get_user_if_change_password_is_allowed(
@@ -193,3 +200,37 @@ async def get_user_if_change_password_is_allowed(
 
 
 CanChangeUserPassword = Depends(get_user_if_change_password_is_allowed)
+
+
+async def show_balance_field(
+    *,
+    request: Request,
+    show_balance: Optional[bool] = False,  # from /user/?show_balance=true
+) -> bool:
+    """Returns True if one of the conditions is met.
+    1. show_balance is True AND
+    2. authenticated_user.superuser OR
+    3. authenticated_user.username == username
+    """
+    if not show_balance:
+        return False
+
+    username = request.path_params.get("username")
+
+    try:
+        authenticated_user = get_current_user(token="", request=request)
+    except HTTPException:
+        authenticated_user = None
+
+    if any(
+        [
+            authenticated_user and authenticated_user.superuser,
+            authenticated_user and authenticated_user.username == username,
+        ]
+    ):
+        return True
+
+    return False
+
+
+ShowBalanceField = Depends(show_balance_field)
